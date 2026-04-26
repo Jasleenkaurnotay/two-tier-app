@@ -1,171 +1,238 @@
-# app needs
+# Two-Tier Application Deployment on AWS
 
-<!-- # DB_LINK = "postgresql://{user}:{password}@{host}:5432/{database_name}"
-
-# host = "localhost"
-# port = 5432
-# database_name = "mydb"
-# user = "postgres"
-# password = "postgres"
-
-# Run Postgre on ec2 -->
-
-**Install PostgreSQL on Amazon Linux 2023:**
-
-```bash
-sudo dnf install postgresql15-server postgresql15 -y
-
-# Initialise the database cluster
-sudo postgresql-setup --initdb
-
-# Enable and start the service
-sudo systemctl enable postgresql --now
-
-# Verify it's running
-sudo systemctl status postgresql
-```
+An exercise demonstrating how to deploy a two-tier web application on AWS using a custom VPC, Auto Scaling Group (ASG), Application Load Balancer (ALB), and a managed RDS PostgreSQL database — with HTTPS termination at the load balancer.
 
 ---
 
-**Create the database matching your DB_LINK:**
+## Architecture Overview
 
-```bash
-# Switch to the postgres system user
-sudo -i -u postgres
-
-# Set the password for the postgres role (must match your DB_LINK)
-psql -c "ALTER USER postgres WITH PASSWORD 'password';"
-
-# Create the database
-psql -c "CREATE DATABASE mydb;"
-
-# Verify
-psql -c "\l"
-
-# Exit back to ec2-user
-exit
 ```
+Internet
+   │
+   ▼
+[ALB] (Public Subnets — 2 AZs)
+   │  Port 80 / 443
+   ▼
+[ASG → EC2 App Servers] (Private Subnets — Port 8000)
+   │
+   ▼
+[RDS PostgreSQL] (Isolated Private Subnets — Port 5432)
+```
+
+### VPC Subnet Layout
+
+| Subnet Type | Purpose | Count |
+|---|---|---|
+| Public | ALB | 2 (one per AZ) |
+| Private | EC2 app servers + NAT Gateway | 2 |
+| Private (isolated) | RDS | 2 |
+
+### Security Group Rules
+
+| Resource | Inbound Rule |
+|---|---|
+| ALB | Port 80 and 443 from `0.0.0.0/0` |
+| EC2 (ASG) | Port 8000 from ALB Security Group only |
+| RDS | Port 5432 from EC2 Security Group only |
 
 ---
 
-**Allow password-based login (md5 auth):**
+## Step-by-Step Setup
 
-By default AL2023 uses `ident` auth which blocks password logins. Fix it:
+### Step 1: Create the RDS Database
 
-```bash
-sudo vi /var/lib/pgsql/data/pg_hba.conf
-```
-
-Change these lines:
-
-```
-# FROM
-host    all    all    127.0.0.1/32    ident
-host    all    all    ::1/128         ident
-
-# TO
-host    all    all    127.0.0.1:5432    md5
-host    all    all    ::1/128           md5
-```
-
-Then restart:
-
-```bash
-sudo systemctl restart postgresql
-```
+1. Go to **RDS → Create database**
+2. Engine: **PostgreSQL**, Template: **Free tier / Sandbox**, Single-AZ
+3. Set a master username and a strong password (avoid special characters like `!` as they can break shell scripts)
+4. Create a **custom DB subnet group** using the two isolated private subnets
+5. Disable public access
+6. Set an initial database name that matches what your application expects
+7. Note the RDS endpoint once the instance is available — you'll need it in the user data script
 
 ---
 
-**Test your connection with the exact DB_LINK:**
+### Step 2: Create the EC2 Launch Template
+
+1. Go to **EC2 → Launch Templates → Create launch template**
+2. Settings:
+   - AMI: **Amazon Linux 2**
+   - Instance type: `t2.micro`
+   - Security group: the one allowing port 8000 from the ALB SG
+   - Do **not** hardcode a subnet in the template — let the ASG control placement
+3. In the **User Data** section, add the bootstrap script (see below)
+4. Attach an IAM role that allows S3 read access (needed to restore the database backup)
+
+#### User Data Script
 
 ```bash
-export DB_LINK="postgresql://postgres:password@localhost:5432/mydb"
-psql $DB_LINK
-```
+#!/bin/bash
+exec > /var/log/userdata.log 2>&1
 
+# Install dependencies
+sudo yum install git -y
 
-# Export database connection string
-export DB_LINK="postgresql://postgres:password@localhost:5432/mydb"
+# Clone application repository
+git clone https://<github-username>:<app-password>@github.com/<your-org>/<your-repo>.git /home/ec2-user/app
 
+cd /home/ec2-user/app
 
-
-
-# cd to src
-
-cd src
-
-# Virtual env
-
-python3 -m venv venv
-
-source venv/bin/activate
+# Set up Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
 pip install -r requirements.txt
 
+# Set database connection string
+export DB_LINK='postgresql://<db-user>:<db-password>@<rds-endpoint>:5432/<db-name>'
 
-
-
-
-## backup and restore
-**Step 1 — Dump the database to a local file:**
-
-```bash
-export DB_LINK="postgresql://postgres:password@localhost:5432/mydb"
-
-# Custom format (-Fc) — compressed, best for pg_restore
-pg_dump -Fc $DB_LINK -f /tmp/mydb_$(date +%Y%m%d_%H%M%S).dump
-
-# Verify the file was created
-ls -lh /tmp/mydb_*.dump
+# Start the application
+gunicorn run:app --bind 0.0.0.0:8000 &
 ```
 
-> Save the exact filename, you'll need it in the next steps.
+> **Note:** Replace all `<placeholder>` values with your actual credentials. Never commit real credentials to a public repository — use AWS Secrets Manager or environment-specific configuration for production workloads.
 
-```bash
-# Set it as a variable for convenience
-DUMP_FILE=$(ls -t /tmp/mydb_*.dump | head -1)
-echo $DUMP_FILE
-```
+**Key lessons learned:**
+- Always start user data scripts with `#!/bin/bash` — cloud-init requires it
+- Avoid special characters (e.g. `!`) in passwords used inside shell scripts
+- Logs are available at `/var/log/userdata.log` and `/var/log/cloud-init-output.log`
 
 ---
 
-**Step 2 — Upload the dump to S3:**
+### Step 3: Validate on a Test EC2 Instance
+
+Before finalizing the launch template, test it manually on a temporary public EC2 instance:
+
+1. Launch an instance from the template into a **public subnet** temporarily
+2. Add an SSH inbound rule to its security group for your IP
+3. SSH in and run the user data commands manually, one by one
+4. Restore the database backup from S3:
 
 ```bash
-# Make sure your EC2 has an IAM role with s3:PutObject permission
-aws s3 cp $DUMP_FILE s3://your-bucket-name/backups/
+# Install PostgreSQL client
+sudo yum install -y postgresql15   # use the version matching your RDS engine
 
-# Verify it's there
-aws s3 ls s3://your-bucket-name/backups/
+# Copy backup from S3
+aws s3 cp s3://<your-bucket>/<backup-file>.dump /home/ec2-user/
+
+# Restore into RDS
+pg_restore -h <rds-endpoint> -U <db-user> -d <db-name> -v <backup-file>.dump
+
+# Verify tables were restored
+psql -h <rds-endpoint> -U <db-user> -d <db-name>
+# Inside psql:
+# \dt   → list tables
+# \du   → list roles
 ```
+
+5. Verify the application started correctly:
+
+```bash
+# Check if gunicorn is running
+ps -eo comm,pid | grep gunicorn
+
+# Check if it's listening on port 8000
+sudo lsof -i :8000
+
+# Test HTTP response locally
+curl -i localhost:8000
+```
+
+6. Once everything works, update the launch template with the final user data script
+7. Set the working version as the **default** template version
+8. **Delete the test EC2 instance** — the ASG will manage instances going forward
 
 ---
 
-**Step 3 — Restore from S3:**
+### Step 4: Create the Auto Scaling Group
 
-```bash
-# Download the dump from S3
-aws s3 cp s3://your-bucket-name/backups/mydb_20240419_120000.dump /tmp/restore.dump
-
-# Drop and recreate the target database (clean restore)
-sudo -i -u postgres psql -c "DROP DATABASE IF EXISTS mydb;"
-sudo -i -u postgres psql -c "CREATE DATABASE mydb;"
-
-# Restore
-pg_restore -Fc -d $DB_LINK /tmp/restore.dump
-
-# Verify tables are back
-psql $DB_LINK -c "\dt"
-```
+1. Go to **EC2 → Auto Scaling Groups → Create Auto Scaling Group**
+2. Select your finalized launch template and its default version
+3. Network settings:
+   - VPC: your custom VPC
+   - Subnets: the **private** subnets (not public)
+4. Skip the load balancer for now — you'll attach it after creating the ASG
+5. Health checks: leave EC2 health checks enabled (default)
+6. Group size and scaling:
+   - Set minimum, desired, and maximum instance counts
+   - Add a **Target Tracking Policy**: scale when average CPU utilization exceeds 50%
+7. Create the ASG — it will automatically launch the minimum number of instances using the launch template
 
 ---
 
-**Quick reference — all 3 flags explained:**
+### Step 5: Create a NAT Gateway
 
-| flag | meaning |
-|------|---------|
-| `-Fc` | custom compressed format, required for `pg_restore` |
-| `-f` | output file path |
-| `-d` | target database connection string |
+Private EC2 instances need outbound internet access to pull code and install packages.
 
-> If you want plain SQL instead (readable but larger), swap `-Fc` for `-Fp` on dump and use `psql $DB_LINK -f restore.dump` instead of `pg_restore` to restore.
+1. Go to **VPC → NAT Gateways → Create NAT Gateway**
+2. Place the NAT Gateway in a **public subnet**
+3. Allocate a new Elastic IP
+4. Update the **route table** for your private subnets to route `0.0.0.0/0` through the NAT Gateway
+
+---
+
+### Step 6: Create the Application Load Balancer
+
+1. Go to **EC2 → Load Balancers → Create Application Load Balancer**
+2. Scheme: **Internet-facing**
+3. VPC: your custom VPC; select at least **two Availability Zones** with public subnets
+4. Security group: create a new one allowing inbound **port 80** and **port 443** from `0.0.0.0/0`
+5. Listeners and routing:
+   - Create a **Target Group** first:
+     - Target type: **Instances**
+     - Protocol: HTTP, Port: **8000** (your application port)
+     - Health check path: `/login` (or a path your app responds to with 200)
+   - Return to the ALB wizard and attach this target group to the listener on port 80
+6. Finish creating the load balancer
+
+**Wait for:**
+- Load balancer state → **Active**
+- Target group health status → **Healthy**
+
+---
+
+### Step 7: Fix Health Checks (if needed)
+
+If health checks fail:
+
+- Make sure the EC2 security group allows inbound traffic on port 8000 **from the ALB security group** (not from all IPs)
+- Make sure the health check path in the target group returns HTTP 200. Update it to a valid path (e.g. `/login`) if needed
+
+---
+
+### Step 8: Test the Application
+
+Access your application via the ALB DNS name over HTTP:
+
+```
+http://<alb-dns-name>
+```
+
+You should see your application load successfully.
+
+---
+
+### Step 9: Enable HTTPS
+
+1. Ensure you have a public certificate in **AWS Certificate Manager (ACM)** for your domain (e.g. `*.yourdomain.com`)
+2. Go to your load balancer → **Listeners → Add listener**
+   - Protocol: HTTPS, Port: 443
+   - Forward to the same target group
+   - Select your ACM certificate
+3. In **Route 53**, create an **A record** (alias) pointing your domain to the ALB DNS name
+4. Your application is now accessible over HTTPS:
+
+```
+https://app.yourdomain.com
+```
+
+## Technologies Used
+
+- **AWS VPC** — custom network with public and private subnets
+- **AWS RDS** — managed PostgreSQL database
+- **AWS EC2 + ASG** — auto-scaling application servers
+- **AWS ALB** — internet-facing load balancer with HTTPS termination
+- **AWS NAT Gateway** — outbound internet for private instances
+- **AWS S3** — database backup storage
+- **AWS ACM** — SSL/TLS certificate management
+- **AWS Route 53** — DNS management
+- **Gunicorn** — Python WSGI application server
